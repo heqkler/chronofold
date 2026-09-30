@@ -54,7 +54,7 @@
     <div class="scan"></div>
   </div>
   <footer>
-    <b>←→ / A D</b> move &nbsp; <b>↑ / W / SPACE</b> jump &nbsp; <b>R</b> fold time (spawn echo) &nbsp; <b>Z</b> reset level &nbsp; <b>M</b> mute &nbsp; <b>ENTER</b> start / next
+    <b>←→ / A D</b> move &nbsp; <b>↑ / W / SPACE</b> jump &nbsp; <b>R</b> fold time (spawn echo) &nbsp; <b>Z</b> reset level &nbsp; <b>M</b> mute &nbsp; <b>ESC</b> pause &nbsp; <b>ENTER</b> start / next
   </footer>
 
 <script>
@@ -83,17 +83,18 @@ addEventListener("keydown", e => {
   if (["ArrowLeft","ArrowRight","ArrowUp","ArrowDown"," "].includes(e.key)) e.preventDefault();
   keys[e.key.toLowerCase()] = true;
   if (e.key === "Enter") enterPressed = true;
+  if (!e.repeat) nav[e.key.toLowerCase()] = true;
   if (e.key.toLowerCase() === "r") rPressed = true;
   if (e.key.toLowerCase() === "z") zPressed = true;
   if (e.key.toLowerCase() === "m") {
-    muted = !muted;
-    if (master) master.gain.value = muted ? 0 : 0.5;
+    toggleMute();
     showMsg(muted ? "SOUND OFF" : "SOUND ON");
   }
 });
 addEventListener("keyup", e => { keys[e.key.toLowerCase()] = false; });
 cv.addEventListener("pointerdown", () => { audioBoot(); enterPressed = true; });
 let enterPressed = false, rPressed = false, zPressed = false;
+let nav = {};                  // edge-triggered key presses for menus
 
 const liveInput = () => {
   let b = 0;
@@ -296,7 +297,7 @@ const LEVELS = [
 ];
 
 /* ---------- game state ---------- */
-let state = "TITLE";          // TITLE | PLAY | REWIND | CLEAR | WIN
+let state = "TITLE";          // TITLE | SELECT | PLAY | PAUSE | REWIND | CLEAR | WIN
 let levelIdx = 0, level = null;
 let frame = 0;                // frames since loop start (shared clock)
 let player = null, echoes = [];
@@ -318,6 +319,36 @@ const crect = c => ({x:c.x, y:c.y, w:CW, h:CH});
 const medalFor = (folds, par) => folds <= par ? "GOLD" : folds <= par + 1 ? "SILVER" : "BRONZE";
 const MEDAL_C = { GOLD:"#ffd166", SILVER:"#cdd3ea", BRONZE:"#d59a6b" };
 
+/* ---------- saved progress ---------- */
+const SAVE_KEY = "chronofold.save.v1";
+let save = { best: {} };       // best: { levelIndex: {folds, par, time, medal} }
+try {
+  const raw = JSON.parse(localStorage.getItem(SAVE_KEY));
+  if (raw && typeof raw.best === "object") save = raw;
+} catch (e) {}
+function writeSave() { try { localStorage.setItem(SAVE_KEY, JSON.stringify(save)); } catch (e) {} }
+const unlockedCount = () => {
+  let n = 0;
+  while (n < LEVELS.length && save.best[n]) n++;
+  return Math.min(LEVELS.length, n + 1);
+};
+function recordBest(i, r) {
+  const old = save.best[i];
+  const rank = m => ({GOLD:3, SILVER:2, BRONZE:1})[m] || 0;
+  if (!old || r.folds < old.folds || (r.folds === old.folds && r.time < old.time)) {
+    save.best[i] = { folds:r.folds, par:r.par, time:r.time, medal:r.medal };
+  } else if (rank(r.medal) > rank(old.medal)) old.medal = r.medal;
+  writeSave();
+}
+
+/* ---------- menus ---------- */
+let selIdx = 0, pauseIdx = 0;
+const PAUSE_ITEMS = ["RESUME", "RESTART LEVEL", "LEVEL SELECT", "SOUND: ON"];
+function toggleMute() {
+  muted = !muted;
+  if (master) master.gain.value = muted ? 0 : 0.5;
+}
+
 function makeEntity(x, y) {
   return { x, y, vx:0, vy:0, grounded:false, prevJ:false, coyote:0, face:1, trail:[], _tin:{} };
 }
@@ -330,6 +361,11 @@ function loadLevel(i) {
   levelFolds = 0; levelDeaths = 0; levelFrames = 0;
   fullResetLoop();
   showMsg(level.name);
+}
+function restartLevel() {
+  echoes = [];
+  crates = (level.crates || []).map(([x, y]) => ({x, y, vy:0}));
+  fullResetLoop();
 }
 function fullResetLoop() {
   frame = 0; recording = []; hist = [];
@@ -872,8 +908,57 @@ function drawTitle() {
   ctx.font = "600 16px Bahnschrift, 'Segoe UI', sans-serif";
   const pulse = 0.6 + 0.4 * Math.sin(gt * 0.08);
   ctx.globalAlpha = pulse;
-  ctx.fillText("PRESS ENTER TO BEGIN", W/2, 452);
+  ctx.fillText(Object.keys(save.best).length ? "PRESS ENTER TO CONTINUE" : "PRESS ENTER TO BEGIN", W/2, 452);
   ctx.globalAlpha = 1;
+}
+
+function drawSelect() {
+  drawBackground();
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#e9e6fa";
+  ctx.font = "700 32px Bahnschrift, 'Segoe UI', sans-serif";
+  ctx.fillText("SELECT TIMELINE", W/2, 80);
+  const unlocked = unlockedCount(), cols = 5, cw = 160, ch = 120, gx = 20, gy = 20;
+  const x0 = (W - (cols * cw + (cols - 1) * gx)) / 2, y0 = 120;
+  LEVELS.forEach((lv, i) => {
+    const x = x0 + (i % cols) * (cw + gx), y = y0 + Math.floor(i / cols) * (ch + gy);
+    const locked = i >= unlocked, sel = i === selIdx, b = save.best[i];
+    roundRect(x, y, cw, ch, 10);
+    ctx.fillStyle = sel ? "rgba(122,108,240,0.35)" : "rgba(20,17,40,0.85)"; ctx.fill();
+    ctx.strokeStyle = sel ? "#7be8ff" : "#3a3466"; ctx.lineWidth = sel ? 2.5 : 1.5; ctx.stroke();
+    ctx.globalAlpha = locked ? 0.35 : 1;
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#e9e6fa"; ctx.font = "700 30px Bahnschrift, 'Segoe UI', sans-serif";
+    ctx.fillText(String(i + 1).padStart(2, "0"), x + cw/2, y + 48);
+    ctx.font = "10px monospace"; ctx.fillStyle = "#8f89b8";
+    ctx.fillText(lv.name.split("· ")[1], x + cw/2, y + 68);
+    if (locked) ctx.fillText("LOCKED", x + cw/2, y + 100);
+    else if (b) {
+      ctx.fillStyle = MEDAL_C[b.medal];
+      ctx.beginPath(); ctx.arc(x + 22, y + 96, 6, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "#8f89b8"; ctx.textAlign = "left";
+      ctx.fillText("BEST " + b.folds + "/" + b.par + "  " + (b.time/60).toFixed(1) + "s", x + 34, y + 100);
+      ctx.textAlign = "center";
+    } else ctx.fillText("NEW", x + cw/2, y + 100);
+    ctx.globalAlpha = 1;
+  });
+  ctx.fillStyle = "#8f89b8"; ctx.font = "12px monospace"; ctx.textAlign = "center";
+  ctx.fillText("ARROWS move   ENTER play   ESC back", W/2, 480);
+}
+
+function drawPause() {
+  ctx.fillStyle = "rgba(13,11,30,0.72)"; ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#e9e6fa"; ctx.font = "700 34px Bahnschrift, 'Segoe UI', sans-serif";
+  ctx.fillText("PAUSED", W/2, 170);
+  PAUSE_ITEMS.forEach((t, i) => {
+    const sel = i === pauseIdx;
+    ctx.font = (sel ? "700 " : "") + "20px Bahnschrift, 'Segoe UI', sans-serif";
+    ctx.fillStyle = sel ? "#ffb454" : "#8f89b8";
+    ctx.fillText((sel ? "› " : "") + t + (sel ? " ‹" : ""), W/2, 240 + i * 44);
+  });
+  ctx.fillStyle = "#8f89b8"; ctx.font = "12px monospace";
+  ctx.fillText("UP/DOWN choose   ENTER select   ESC resume", W/2, 470);
 }
 
 function drawWin() {
@@ -928,12 +1013,42 @@ function tick(now) {
 }
 
 function update() {
+  const N = nav; nav = {};
   stepParticles();
   if (shake > 0) shake--;
 
   if (state === "TITLE") {
-    if (enterPressed) { enterPressed = false; totalLoops = 0; deaths = 0; results = []; startPad(); loadLevel(0); state = "PLAY"; }
+    if (enterPressed) {
+      enterPressed = false; totalLoops = 0; deaths = 0; results = []; startPad();
+      selIdx = unlockedCount() - 1; state = "SELECT";
+    }
     rPressed = zPressed = false;
+    return;
+  }
+  if (state === "SELECT") {
+    const unlocked = unlockedCount(), cols = 5;
+    if ((N.arrowright || N.d) && selIdx + 1 < unlocked) selIdx++;
+    if ((N.arrowleft || N.a) && selIdx > 0) selIdx--;
+    if ((N.arrowdown || N.s) && selIdx + cols < unlocked) selIdx += cols;
+    if ((N.arrowup || N.w) && selIdx - cols >= 0) selIdx -= cols;
+    if (N.escape) state = "TITLE";
+    else if (enterPressed) { loadLevel(selIdx); state = "PLAY"; }
+    enterPressed = rPressed = zPressed = false;
+    return;
+  }
+  if (state === "PAUSE") {
+    PAUSE_ITEMS[3] = "SOUND: " + (muted ? "OFF" : "ON");
+    const n = PAUSE_ITEMS.length;
+    if (N.arrowdown || N.s) pauseIdx = (pauseIdx + 1) % n;
+    if (N.arrowup || N.w) pauseIdx = (pauseIdx + n - 1) % n;
+    if (N.escape) state = "PLAY";
+    else if (enterPressed) {
+      if (pauseIdx === 0) state = "PLAY";
+      else if (pauseIdx === 1) { restartLevel(); showMsg("LEVEL RESTARTED"); state = "PLAY"; }
+      else if (pauseIdx === 2) { selIdx = levelIdx; state = "SELECT"; }
+      else toggleMute();
+    }
+    enterPressed = rPressed = zPressed = false;
     return;
   }
   if (state === "WIN") {
@@ -946,7 +1061,8 @@ function update() {
     if (enterPressed) { enterPressed = false; clearT = 0; }
     if (clearT <= 0) {
       if (levelIdx + 1 < LEVELS.length) { loadLevel(levelIdx + 1); state = "PLAY"; }
-      else { state = "WIN"; SFX.win(); }
+      else if (Object.keys(save.best).length >= LEVELS.length) { state = "WIN"; SFX.win(); }
+      else { selIdx = 0; state = "SELECT"; }
     }
     return;
   }
@@ -959,11 +1075,10 @@ function update() {
   }
 
   /* PLAY */
+  if (N.escape) { pauseIdx = 0; state = "PAUSE"; rPressed = zPressed = false; return; }
   if (zPressed) {
     zPressed = false;
-    echoes = [];
-    crates = (level.crates || []).map(([x, y]) => ({x, y, vy:0}));
-    fullResetLoop();
+    restartLevel();
     showMsg("TIMELINE WIPED");
     return;
   }
@@ -981,6 +1096,7 @@ function update() {
       name: level.name, folds: levelFolds, par: level.par,
       time: levelFrames, medal: medalFor(levelFolds, level.par)
     };
+    recordBest(levelIdx, results[levelIdx]);
     SFX.clear();
     burst(level.exit[0] + 17, level.exit[1] + 22, "#59f2c2", 44);
     state = "CLEAR"; clearT = 190;
@@ -993,6 +1109,7 @@ function render() {
   if (shake > 0) ctx.translate((Math.random()-0.5) * shake, (Math.random()-0.5) * shake);
 
   if (state === "TITLE") { drawTitle(); ctx.restore(); return; }
+  if (state === "SELECT") { drawSelect(); ctx.restore(); return; }
   if (state === "WIN") { drawWin(); ctx.restore(); return; }
 
   if (state === "REWIND") {
@@ -1025,6 +1142,7 @@ function render() {
   }
 
   drawScene();
+  if (state === "PAUSE") drawPause();
 
   if (state === "CLEAR") {
     ctx.fillStyle = "rgba(13,11,30,0.62)"; ctx.fillRect(0, 0, W, H);
