@@ -1,11 +1,23 @@
 {
   "name": "chronofold",
   "productName": "Chronofold",
-  "version": "1.0.0",
+  "version": "1.1.0",
+  "description": "A puzzle game about cooperating with your past selves.",
+  "author": "heqkler",
+  "license": "UNLICENSED",
+  "private": true,
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "pack": "electron-packager . Chronofold --platform=win32 --arch=x64 --overwrite"
+    "test": "node test/run.js",
+    "pack": "electron-packager . Chronofold --platform=win32 --arch=x64 --overwrite --ignore=\"^/(test|\\.github|TODO\\.md|dist|Chronofold-.*)\"",
+    "dist": "npx --yes electron-builder --win portable"
+  },
+  "build": {
+    "appId": "com.chronofold.game",
+    "productName": "Chronofold",
+    "files": ["main.js", "chronofold.html", "src/**", "build/icon.png"],
+    "win": { "target": "portable" }
   },
   "devDependencies": {
     "electron": "^43.0.0",

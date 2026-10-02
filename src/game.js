@@ -1,0 +1,1061 @@
+"use strict";
+/* ============================== CHRONOFOLD ==============================
+   Every run, your inputs are recorded. Press R to FOLD TIME: the world
+   rewinds, and an ECHO of your past self replays your exact run beside
+   you. Echoes are solid — stand on their heads. Echoes hold plates.
+   Lasers can't touch an echo. Choreograph yourself across timelines.
+   ======================================================================= */
+
+const cv = document.getElementById("cv");
+const ctx = cv.getContext("2d");
+const W = 960, H = 540;
+
+/* ---------- tuning ---------- */
+const GRAV = 0.55, MOVE = 0.95, MAXV = 4.2, FRICTION = 0.80;
+const JUMPV = -11.5, MAXFALL = 13, COYOTE = 6;
+const REC_CAP = 2700;            // 45s max per loop
+const EW = 26, EH = 34;          // entity size
+
+/* ---------- input ---------- */
+const keys = {};               // held keys, by e.key (lowercased) AND by physical e.code
+let enterPressed = false, rPressed = false, zPressed = false;
+let nav = {};                  // edge-triggered key presses for menus
+const BLOCKED_KEYS = ["ArrowLeft","ArrowRight","ArrowUp","ArrowDown"," ","Tab","Backspace"];
+
+addEventListener("keydown", e => {
+  audioBoot();
+  if (BLOCKED_KEYS.includes(e.key)) e.preventDefault();
+  const k = e.key.toLowerCase();
+  keys[k] = true; keys[e.code] = true;
+  if (e.repeat) return;        // one-shot actions fire once per physical press
+  nav[k] = true;
+  if (k === "enter") enterPressed = true;
+  if (k === "r") rPressed = true;
+  if (k === "z") zPressed = true;
+  if (k === "m") {
+    toggleMute();
+    showMsg(muted ? "SOUND OFF" : "SOUND ON");
+  }
+});
+addEventListener("keyup", e => { keys[e.key.toLowerCase()] = false; keys[e.code] = false; });
+/* losing focus must not leave keys stuck, and should pause a live run */
+function releaseAll() {
+  for (const k in keys) keys[k] = false;
+  enterPressed = rPressed = zPressed = false; nav = {};
+}
+addEventListener("blur", () => {
+  releaseAll();
+  if (state === "PLAY") { pauseIdx = 0; state = "PAUSE"; }
+});
+cv.addEventListener("pointerdown", () => { audioBoot(); enterPressed = true; });
+
+const liveInput = () => {
+  let b = 0;
+  if (keys["arrowleft"] || keys["KeyA"] || keys["a"]) b |= 1;
+  if (keys["arrowright"] || keys["KeyD"] || keys["d"]) b |= 2;
+  if (keys["arrowup"] || keys["KeyW"] || keys["w"] || keys[" "]) b |= 4;
+  return b;
+};
+
+/* ---------- audio (pure WebAudio synthesis — no files) ---------- */
+let AC = null, master = null, sfxBus = null, musicBus = null, padOn = false, muted = false;
+const VOL_STEPS = 5;           // music / sfx volume sliders run 0..VOL_STEPS
+const volGain = v => v / VOL_STEPS;
+function audioBoot() {
+  if (!AC) {
+    try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { return; }
+    master = AC.createGain(); master.gain.value = muted ? 0 : 0.5; master.connect(AC.destination);
+    sfxBus = AC.createGain(); sfxBus.gain.value = volGain(save.settings.sfx); sfxBus.connect(master);
+    musicBus = AC.createGain(); musicBus.gain.value = volGain(save.settings.music); musicBus.connect(master);
+  }
+  if (AC.state === "suspended") AC.resume();
+}
+function tone(type, f0, f1, dur, gain, delay = 0) {
+  if (!AC || muted || save.settings.sfx === 0) return;
+  const t0 = AC.currentTime + delay;
+  const o = AC.createOscillator(), g = AC.createGain();
+  o.type = type; o.frequency.setValueAtTime(f0, t0);
+  if (f1) o.frequency.exponentialRampToValueAtTime(Math.max(20, f1), t0 + dur);
+  g.gain.setValueAtTime(0.0001, t0);
+  g.gain.exponentialRampToValueAtTime(gain, t0 + 0.012);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  o.connect(g); g.connect(sfxBus);
+  o.start(t0); o.stop(t0 + dur + 0.05);
+}
+function hiss(dur, gain, delay = 0) {
+  if (!AC || muted || save.settings.sfx === 0) return;
+  const t0 = AC.currentTime + delay;
+  const n = Math.floor(AC.sampleRate * dur), buf = AC.createBuffer(1, n, AC.sampleRate);
+  const d = buf.getChannelData(0);
+  for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / n);
+  const src = AC.createBufferSource(); src.buffer = buf;
+  const f = AC.createBiquadFilter(); f.type = "bandpass"; f.frequency.value = 900; f.Q.value = 0.6;
+  const g = AC.createGain(); g.gain.value = gain;
+  src.connect(f); f.connect(g); g.connect(sfxBus);
+  src.start(t0);
+}
+const SFX = {
+  jump:    () => tone("square", 300, 540, 0.12, 0.06),
+  fold:    () => { tone("sawtooth", 880, 70, 0.7, 0.13); hiss(0.55, 0.10); },
+  commit:  () => { tone("sine", 523, null, 0.10, 0.10); tone("sine", 784, null, 0.14, 0.10, 0.07); },
+  plateOn: () => tone("sine", 230, 320, 0.07, 0.09),
+  plateOff:() => tone("sine", 320, 210, 0.07, 0.06),
+  toggle:  () => { tone("square", 370, null, 0.05, 0.06); tone("square", 555, null, 0.07, 0.06, 0.05); },
+  door:    () => { tone("triangle", 330, null, 0.30, 0.06); tone("triangle", 415, null, 0.30, 0.06, 0.02); tone("triangle", 494, null, 0.34, 0.06, 0.04); },
+  erase:   () => { hiss(0.30, 0.15); tone("sawtooth", 220, 55, 0.28, 0.10); },
+  desync:  () => { hiss(0.40, 0.18); tone("sawtooth", 160, 40, 0.40, 0.15); },
+  clear:   () => [392, 494, 587, 784].forEach((f, i) => tone("sine", f, null, 0.16, 0.09, i * 0.07)),
+  win:     () => [392, 494, 587, 784, 988, 1175].forEach((f, i) => tone("sine", f, null, 0.22, 0.08, i * 0.09)),
+};
+function startPad() {
+  if (!AC || padOn) return; padOn = true;
+  const g = AC.createGain(); g.gain.value = 0.028;
+  const f = AC.createBiquadFilter(); f.type = "lowpass"; f.frequency.value = 240; f.Q.value = 0.7;
+  [55, 55.5, 82.5].forEach(fr => {
+    const o = AC.createOscillator(); o.type = "sawtooth"; o.frequency.value = fr;
+    o.connect(f); o.start();
+  });
+  const lfo = AC.createOscillator(), lg = AC.createGain();
+  lfo.frequency.value = 0.06; lg.gain.value = 90;
+  lfo.connect(lg); lg.connect(f.frequency); lfo.start();
+  f.connect(g); g.connect(musicBus);
+}
+
+/* ---------- game state ---------- */
+let state = "TITLE";          // TITLE | SELECT | PLAY | PAUSE | REWIND | CLEAR | WIN
+let levelIdx = 0, level = null;
+let frame = 0;                // frames since loop start (shared clock)
+let player = null, echoes = [];
+let recording = [], hist = [];
+let liftOffs = [], liftPrevY = [];
+let rewindPtr = 0, clearT = 0, shake = 0, shakeX = 0, shakeY = 0;
+let msg = "", msgT = 0, totalLoops = 0, deaths = 0;
+let gt = 0;                   // global time for ambient animation
+let particles = [];
+
+/* new-mechanic + scoring state */
+const CW = 30, CH = 30;       // crate size
+let toggleState = {};         // toggle id -> on/off (resets each loop; echoes re-flip)
+let crates = [];              // crates PERSIST across folds (reset on Z / level load)
+let levelFolds = 0, levelDeaths = 0, levelFrames = 0;
+let results = [];             // per-level medal results
+let prevPlateMap = null, prevOpenCount = null;   // sound edge detection
+const crect = c => ({x:c.x, y:c.y, w:CW, h:CH});
+const medalFor = (folds, par) => folds <= par ? "GOLD" : folds <= par + 1 ? "SILVER" : "BRONZE";
+const MEDAL_C = { GOLD:"#ffd166", SILVER:"#cdd3ea", BRONZE:"#d59a6b" };
+
+/* ---------- saved progress ---------- */
+const SAVE_KEY = "chronofold.save.v1";
+let save = { best: {}, settings: { music: VOL_STEPS, sfx: VOL_STEPS } };  // best: { levelIndex: {folds, par, time, medal} }
+const clampVol = v => Number.isInteger(v) ? Math.max(0, Math.min(VOL_STEPS, v)) : VOL_STEPS;
+/* untrusted input: keep only well-formed entries for levels that exist */
+function sanitizeSave(raw) {
+  const out = { best: {}, settings: { music: VOL_STEPS, sfx: VOL_STEPS } };
+  if (!raw || typeof raw !== "object") return out;
+  if (raw.best && typeof raw.best === "object") {
+    for (const k of Object.keys(raw.best)) {
+      const i = Number(k), b = raw.best[k];
+      if (!Number.isInteger(i) || i < 0 || i >= LEVELS.length || !b) continue;
+      if (!Number.isFinite(b.folds) || !Number.isFinite(b.par) || !Number.isFinite(b.time) || !(b.medal in MEDAL_C)) continue;
+      out.best[i] = { folds:b.folds, par:b.par, time:b.time, medal:b.medal };
+    }
+  }
+  if (raw.settings && typeof raw.settings === "object") {
+    out.settings.music = clampVol(raw.settings.music);
+    out.settings.sfx = clampVol(raw.settings.sfx);
+  }
+  return out;
+}
+try { save = sanitizeSave(JSON.parse(localStorage.getItem(SAVE_KEY))); } catch (e) {}
+function writeSave() { try { localStorage.setItem(SAVE_KEY, JSON.stringify(save)); } catch (e) {} }
+const unlockedCount = () => {
+  let n = 0;
+  while (n < LEVELS.length && save.best[n]) n++;
+  return Math.min(LEVELS.length, n + 1);
+};
+function recordBest(i, r) {
+  const old = save.best[i];
+  const rank = m => ({GOLD:3, SILVER:2, BRONZE:1})[m] || 0;
+  if (!old || r.folds < old.folds || (r.folds === old.folds && r.time < old.time)) {
+    save.best[i] = { folds:r.folds, par:r.par, time:r.time, medal:r.medal };
+  } else if (rank(r.medal) > rank(old.medal)) old.medal = r.medal;
+  writeSave();
+}
+
+/* ---------- menus ---------- */
+let selIdx = 0, pauseIdx = 0;
+const PAUSE_ITEMS = ["RESUME", "RESTART LEVEL", "LEVEL SELECT", "SOUND: ON", "MUSIC", "SFX"];
+function toggleMute() {
+  muted = !muted;
+  if (master) master.gain.value = muted ? 0 : 0.5;
+}
+function adjustVolume(kind, d) {
+  save.settings[kind] = Math.max(0, Math.min(VOL_STEPS, save.settings[kind] + d));
+  const bus = kind === "music" ? musicBus : sfxBus;
+  if (bus) bus.gain.value = volGain(save.settings[kind]);
+  writeSave();
+  if (kind === "sfx") SFX.commit();
+}
+const volBar = v => "█".repeat(v) + "░".repeat(VOL_STEPS - v);
+
+function makeEntity(x, y) {
+  return { x, y, vx:0, vy:0, grounded:false, prevJ:false, coyote:0, face:1, trail:[], _tin:{} };
+}
+function showMsg(t){ msg = t; msgT = 130; }
+
+function loadLevel(i) {
+  levelIdx = i; level = LEVELS[i];
+  echoes = [];
+  crates = (level.crates || []).map(([x, y]) => ({x, y, vy:0}));
+  levelFolds = 0; levelDeaths = 0; levelFrames = 0;
+  fullResetLoop();
+  showMsg(level.name);
+}
+function restartLevel() {
+  echoes = [];
+  crates = (level.crates || []).map(([x, y]) => ({x, y, vy:0}));
+  fullResetLoop();
+}
+function fullResetLoop() {
+  frame = 0; recording = []; hist = [];
+  player = makeEntity(level.spawn[0], level.spawn[1]);
+  for (const ec of echoes) {
+    ec.x = level.spawn[0]; ec.y = level.spawn[1];
+    ec.vx = 0; ec.vy = 0; ec.prevJ = false; ec.coyote = 0; ec.trail = []; ec._tin = {};
+  }
+  toggleState = {};
+  (level.toggles || []).forEach(t => toggleState[t.id] = false);
+  prevPlateMap = null; prevOpenCount = null;
+  liftOffs = level.lifts.map(() => 0);
+  liftPrevY = level.lifts.map(l => l.y);
+}
+
+/* ---------- geometry ---------- */
+const overlap = (a,b) => a.x < b.x+b.w && a.x+a.w > b.x && a.y < b.y+b.h && a.y+a.h > b.y;
+const erect = e => ({x:e.x, y:e.y, w:EW, h:EH});
+
+function laserOn(l, t){ return ((t + l.offset) % l.period) < l.duty; }
+
+function platePressed(pl, ents) {
+  const zone = {x:pl.x, y:pl.y-12, w:pl.w, h:14};
+  return ents.some(e => overlap(erect(e), zone));
+}
+function computePlates(ents) {
+  const map = {};
+  for (const pl of level.plates) {
+    const zone = {x:pl.x, y:pl.y - 12, w:pl.w, h:14};
+    map[pl.id] = platePressed(pl, ents) || crates.some(c => overlap(crect(c), zone));
+  }
+  for (const t of (level.toggles || [])) map[t.id] = !!toggleState[t.id];
+  return map;
+}
+const sigOK = (id, map) => id[0] === "!" ? !map[id.slice(1)] : !!map[id];
+function doorOpen(d, plateMap){ return d.req.every(id => sigOK(id, plateMap)); }
+
+function currentSolids(plateMap) {
+  const s = level.solids.map(r => ({x:r[0], y:r[1], w:r[2], h:r[3]}));
+  for (const d of level.doors) if (!doorOpen(d, plateMap)) s.push({x:d.x, y:d.y, w:d.w, h:d.h});
+  level.lifts.forEach((l, i) => s.push({x:l.x, y:l.y + liftOffs[i], w:l.w, h:l.h, lift:i}));
+  return s;
+}
+
+/* ---------- physics ---------- */
+function stepEntity(e, input, solids, others, pushables) {
+  const L = !!(input & 1), R = !!(input & 2), J = !!(input & 4);
+
+  if (L) { e.vx -= MOVE; e.face = -1; }
+  if (R) { e.vx += MOVE; e.face = 1; }
+  if (!L && !R) e.vx *= FRICTION;
+  e.vx = Math.max(-MAXV, Math.min(MAXV, e.vx));
+
+  if (J && !e.prevJ && (e.grounded || e.coyote > 0)) { e.vy = JUMPV; e.coyote = 0; if (e === player) SFX.jump(); }
+  e.prevJ = J;
+
+  /* horizontal */
+  e.x += e.vx;
+  for (const s of solids) if (overlap(erect(e), s)) {
+    if (e.grounded && s.y > e.y + EH - 17) { e.y = s.y - EH; continue; } /* step up low ledges */
+    /* a solid that closed on a motionless entity pushes it out the nearer side (not onto its roof) */
+    const dir = e.vx !== 0 ? Math.sign(e.vx) : (e.x + EW/2 < s.x + s.w/2 ? 1 : -1);
+    if (dir > 0) e.x = s.x - EW; else e.x = s.x + s.w;
+    e.vx = 0;
+  }
+  /* crate pushing (player and echoes, so replays stay faithful) */
+  if (pushables) for (const c of pushables) {
+    if (!overlap(erect(e), crect(c))) continue;
+    if (e.x + EW/2 < c.x + CW/2) {           /* pushing right */
+      const dx = (e.x + EW) - c.x;
+      if (dx > 0 && dx < 20) {
+        c.x += dx;
+        for (const s of solids) if (overlap(crect(c), s)) c.x = Math.min(c.x, s.x - CW);
+        for (const o of pushables) if (o !== c && overlap(crect(c), crect(o))) c.x = Math.min(c.x, o.x - CW);
+        c.x = Math.min(c.x, W - CW);
+      }
+      e.x = Math.min(e.x, c.x - EW);
+    } else {                                  /* pushing left */
+      const dx = (c.x + CW) - e.x;
+      if (dx > 0 && dx < 20) {
+        c.x -= dx;
+        for (const s of solids) if (overlap(crect(c), s)) c.x = Math.max(c.x, s.x + s.w);
+        for (const o of pushables) if (o !== c && overlap(crect(c), crect(o))) c.x = Math.max(c.x, o.x + CW);
+        c.x = Math.max(c.x, 0);
+      }
+      e.x = Math.max(e.x, c.x + CW);
+    }
+    e.vx = Math.max(-1.6, Math.min(1.6, e.vx)); /* pushing is heavy */
+  }
+  e.x = Math.max(0, Math.min(W - EW, e.x));
+
+  /* vertical */
+  e.vy = Math.min(MAXFALL, e.vy + GRAV);
+  e.y += e.vy;
+  const wasGrounded = e.grounded;
+  e.grounded = false;
+  const vlist = pushables ? solids.concat(pushables.map(crect)) : solids;
+  for (const s of vlist) if (overlap(erect(e), s)) {
+    if (e.vy > 0) { e.y = s.y - EH; e.grounded = true; e.vy = 0; }
+    else if (e.vy < 0) { e.y = s.y + s.h; e.vy = 0.1; }
+  }
+  /* one-way landing on other entities (stand on your echoes) */
+  if (e.vy > 0) for (const o of others) {
+    if (o === e) continue;
+    const feet = e.y + EH;
+    if (e.x < o.x + EW && e.x + EW > o.x && feet > o.y && feet - e.vy <= o.y + 7) {
+      e.y = o.y - EH; e.grounded = true; e.vy = 0;
+    }
+  }
+  e.coyote = e.grounded ? COYOTE : Math.max(0, e.coyote - 1);
+  if (!e.grounded && wasGrounded && e.vy >= 0) e.coyote = COYOTE;
+
+  e.trail.push({x:e.x, y:e.y});
+  if (e.trail.length > 9) e.trail.shift();
+}
+
+function simulateFrame() {
+  const ents = [...echoes, player];
+
+  /* plates -> lifts (deterministic: uses positions at frame start) */
+  const plateMap = computePlates(ents);
+
+  /* sound edges: plates + doors */
+  if (prevPlateMap) {
+    for (const pl of level.plates) {
+      if (plateMap[pl.id] && !prevPlateMap[pl.id]) SFX.plateOn();
+      else if (!plateMap[pl.id] && prevPlateMap[pl.id]) SFX.plateOff();
+    }
+  }
+  const openCount = level.doors.filter(d => doorOpen(d, plateMap)).length;
+  if (prevOpenCount !== null && openCount > prevOpenCount) SFX.door();
+  prevOpenCount = openCount; prevPlateMap = plateMap;
+
+  level.lifts.forEach((l, i) => {
+    liftPrevY[i] = l.y + liftOffs[i];
+    const powered = l.req.every(id => sigOK(id, plateMap));
+    const target = powered ? -l.up : 0;
+    if (liftOffs[i] < target) liftOffs[i] = Math.min(target, liftOffs[i] + l.speed);
+    else if (liftOffs[i] > target) liftOffs[i] = Math.max(target, liftOffs[i] - l.speed);
+    /* carry riders */
+    const dy = (l.y + liftOffs[i]) - liftPrevY[i];
+    if (dy !== 0) for (const e of ents) {
+      const feet = e.y + EH;
+      if (Math.abs(feet - liftPrevY[i]) < 3 && e.x < l.x + l.w && e.x + EW > l.x) e.y += dy;
+    }
+    if (dy !== 0) for (const c of crates) {
+      if (Math.abs(c.y + CH - liftPrevY[i]) < 3 && c.x < l.x + l.w && c.x + CW > l.x) c.y += dy;
+    }
+  });
+
+  const solids = currentSolids(plateMap);
+
+  /* crates: gravity only (pushing happens in stepEntity). They persist across folds. */
+  for (const c of crates) {
+    c.vy = Math.min(MAXFALL, c.vy + GRAV);
+    c.y += c.vy;
+    for (const s of solids) if (overlap(crect(c), s)) {
+      if (c.vy > 0) { c.y = s.y - CH; c.vy = 0; }
+      else if (c.vy < 0) { c.y = s.y + s.h; c.vy = 0; }
+    }
+    for (const o of crates) if (o !== c && overlap(crect(c), crect(o)) && c.vy > 0) { c.y = o.y - CH; c.vy = 0; }
+  }
+
+  /* echoes replay their recordings, then freeze in place.
+     NOTE: echoes may land on other echoes (deterministic — they repeat exactly)
+     but never on the live player, whose position differs every loop.
+     Echoes shove and stand on crates exactly like the player does. */
+  echoes.forEach(ec => {
+    const input = frame < ec.rec.length ? ec.rec[frame] : 0;
+    stepEntity(ec, input, solids, echoes, crates);
+  });
+
+  /* static fields erase echoes on contact */
+  if (level.erasers) for (const er of level.erasers) {
+    echoes = echoes.filter(ec => {
+      if (overlap(erect(ec), er)) {
+        burst(ec.x + EW/2, ec.y + EH/2, "#ff5d8f", 30);
+        SFX.erase(); shake = 8;
+        showMsg("ECHO ERASED BY STATIC");
+        return false;
+      }
+      return true;
+    });
+  }
+
+  /* player */
+  /* past the cap nothing more is recorded, so live input is dropped too —
+     otherwise the echo would diverge from what the player actually did */
+  const capped = recording.length >= REC_CAP;
+  const input = capped ? 0 : liveInput();
+  if (capped) { if (frame === REC_CAP) showMsg("LOOP LIMIT — FOLD (R) OR RESET (Z)"); }
+  else recording.push(input);
+  stepEntity(player, input, solids, ents, crates);
+
+  /* toggles flip on zone ENTRY (player and echoes alike) */
+  for (const t of (level.toggles || [])) {
+    const zone = {x:t.x, y:t.y - 30, w:24, h:30};
+    for (const e of [...echoes, player]) {
+      const inside = overlap(erect(e), zone);
+      if (inside && !e._tin[t.id]) { toggleState[t.id] = !toggleState[t.id]; SFX.toggle(); burst(t.x + 12, t.y - 24, "#ffb454", 8); }
+      e._tin[t.id] = inside;
+    }
+  }
+
+  /* lasers only harm the living */
+  for (const l of level.lasers) {
+    if (laserOn(l, frame) && overlap(erect(player), l)) return "desync";
+  }
+
+  /* history for rewind VFX */
+  hist.push({ p:[player.x, player.y], e:echoes.map(ec => [ec.x, ec.y]) });
+
+  /* exit */
+  const ex = {x:level.exit[0], y:level.exit[1], w:34, h:44};
+  if (overlap(erect(player), ex)) return "clear";
+
+  frame++; levelFrames++;
+  return null;
+}
+
+function foldTime() {
+  if (recording.length < 20) { showMsg("NOTHING TO FOLD YET"); return; }
+  if (echoes.length >= level.maxEchoes) { showMsg("TIMELINE SATURATED — Z RESETS"); shake = 6; return; }
+  state = "REWIND";
+  rewindPtr = hist.length - 1;
+  SFX.fold();
+  burst(player.x + EW/2, player.y + EH/2, "#7be8ff", 26);
+}
+function finishFold() {
+  const ec = makeEntity(level.spawn[0], level.spawn[1]);
+  ec.rec = recording.slice();
+  echoes.push(ec);
+  totalLoops++; levelFolds++;
+  fullResetLoop();
+  state = "PLAY";
+  SFX.commit();
+  showMsg("ECHO " + echoes.length + " COMMITTED");
+}
+
+/* ---------- particles ---------- */
+function burst(x, y, color, n) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2, sp = 1 + Math.random() * 3;
+    particles.push({x, y, vx:Math.cos(a)*sp, vy:Math.sin(a)*sp, life:30+Math.random()*20, color});
+  }
+}
+function stepParticles() {
+  particles = particles.filter(p => (p.life -= 1) > 0);
+  for (const p of particles) { p.x += p.vx; p.y += p.vy; p.vx *= 0.96; p.vy *= 0.96; }
+}
+
+/* ---------- drawing ---------- */
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x+r, y);
+  ctx.arcTo(x+w, y, x+w, y+h, r);
+  ctx.arcTo(x+w, y+h, x, y+h, r);
+  ctx.arcTo(x, y+h, x, y, r);
+  ctx.arcTo(x, y, x+w, y, r);
+  ctx.closePath();
+}
+
+function drawBackground() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#171236"); g.addColorStop(0.6, "#100d26"); g.addColorStop(1, "#0b0919");
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  /* drifting grid */
+  ctx.strokeStyle = "rgba(122,108,240,0.07)"; ctx.lineWidth = 1;
+  const off = (gt * 0.15) % 48;
+  ctx.beginPath();
+  for (let x = -off; x < W; x += 48) { ctx.moveTo(x, 0); ctx.lineTo(x, H); }
+  for (let y = 0; y < H; y += 48) { ctx.moveTo(0, y); ctx.lineTo(W, y); }
+  ctx.stroke();
+  /* faint stars */
+  ctx.fillStyle = "rgba(233,230,250,0.25)";
+  for (let i = 0; i < 40; i++) {
+    const x = (i * 971) % W, y = (i * 613) % (H - 120);
+    const tw = 0.5 + 0.5 * Math.sin(gt * 0.03 + i);
+    ctx.globalAlpha = 0.12 + 0.18 * tw;
+    ctx.fillRect(x, y, 2, 2);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawSolid(r) {
+  ctx.fillStyle = "#242047";
+  ctx.fillRect(r.x, r.y, r.w, r.h);
+  ctx.fillStyle = "#7a6cf0";
+  ctx.globalAlpha = 0.9; ctx.fillRect(r.x, r.y, r.w, 3); ctx.globalAlpha = 1;
+  ctx.strokeStyle = "rgba(122,108,240,0.25)";
+  ctx.strokeRect(r.x + 0.5, r.y + 0.5, r.w - 1, r.h - 1);
+}
+
+function drawLevelStatics(plateMap) {
+  for (const s of level.solids) drawSolid({x:s[0], y:s[1], w:s[2], h:s[3]});
+
+  level.lifts.forEach((l, i) => {
+    const y = l.y + liftOffs[i];
+    ctx.fillStyle = "#2c2657"; ctx.fillRect(l.x, y, l.w, l.h);
+    ctx.fillStyle = "#ffb454"; ctx.fillRect(l.x, y, l.w, 3);
+    ctx.strokeStyle = "rgba(255,180,84,0.25)";
+    ctx.setLineDash([4, 6]);
+    ctx.beginPath(); ctx.moveTo(l.x + l.w/2, l.y + l.h); ctx.lineTo(l.x + l.w/2, l.y - l.up); ctx.stroke();
+    ctx.setLineDash([]);
+  });
+
+  for (const pl of level.plates) {
+    const on = plateMap[pl.id];
+    ctx.fillStyle = on ? "#f4efff" : "#5b4fd6";
+    ctx.fillRect(pl.x, pl.y - (on ? 3 : 6), pl.w, on ? 3 : 6);
+    if (on) {
+      ctx.fillStyle = "rgba(244,239,255,0.22)";
+      ctx.beginPath(); ctx.ellipse(pl.x + pl.w/2, pl.y - 2, pl.w * 0.75, 10, 0, 0, Math.PI*2); ctx.fill();
+    }
+    ctx.fillStyle = on ? "#f4efff" : "#8f89b8";
+    ctx.font = "9px monospace"; ctx.textAlign = "center";
+    ctx.fillText(pl.id.toUpperCase(), pl.x + pl.w/2, pl.y + 12);
+  }
+
+  /* static eraser fields (behind everything else) */
+  for (const er of (level.erasers || [])) {
+    ctx.fillStyle = "rgba(255,93,143,0.06)"; ctx.fillRect(er.x, er.y, er.w, er.h);
+    ctx.strokeStyle = "rgba(255,93,143,0.45)"; ctx.setLineDash([5,5]);
+    ctx.strokeRect(er.x + 0.5, er.y + 0.5, er.w - 1, er.h - 1); ctx.setLineDash([]);
+    ctx.fillStyle = "rgba(255,120,170,0.35)";
+    for (let i = 0; i < 24; i++) {
+      const sx = er.x + ((i * 97 + gt * 13 + i * i * 31) % (er.w - 10));
+      const sy = er.y + ((i * 61 + gt * 7) % (er.h - 4));
+      ctx.fillRect(sx, sy, 5 + (i % 3) * 3, 1.6);
+    }
+    ctx.fillStyle = "rgba(255,155,185,0.85)"; ctx.font = "9px monospace"; ctx.textAlign = "center";
+    ctx.fillText("STATIC · ERASES ECHOES", er.x + er.w/2, er.y - 6);
+  }
+
+  /* toggles */
+  for (const t of (level.toggles || [])) {
+    const on = toggleState[t.id];
+    const kx = t.x + 12 + (on ? 9 : -9);
+    ctx.fillStyle = "#2c2657"; ctx.fillRect(t.x - 2, t.y - 7, 28, 7);
+    ctx.strokeStyle = on ? "#ffb454" : "#8f89b8"; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(t.x + 12, t.y - 6); ctx.lineTo(kx, t.y - 24); ctx.stroke();
+    ctx.lineWidth = 1;
+    ctx.shadowColor = on ? "rgba(255,180,84,0.9)" : "transparent"; ctx.shadowBlur = on ? 10 : 0;
+    ctx.fillStyle = on ? "#ffb454" : "#8f89b8";
+    ctx.beginPath(); ctx.arc(kx, t.y - 24, 4.5, 0, Math.PI * 2); ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = on ? "#ffb454" : "#8f89b8"; ctx.font = "9px monospace"; ctx.textAlign = "center";
+    ctx.fillText(t.id.toUpperCase() + (on ? " ON" : " OFF"), t.x + 12, t.y + 12);
+  }
+
+  /* crates — they persist through folds */
+  for (const c of crates) {
+    ctx.fillStyle = "#3a2f63"; ctx.fillRect(c.x, c.y, CW, CH);
+    ctx.strokeStyle = "#a08bff";
+    ctx.strokeRect(c.x + 0.5, c.y + 0.5, CW - 1, CH - 1);
+    ctx.beginPath();
+    ctx.moveTo(c.x + 4, c.y + 4); ctx.lineTo(c.x + CW - 4, c.y + CH - 4);
+    ctx.moveTo(c.x + CW - 4, c.y + 4); ctx.lineTo(c.x + 4, c.y + CH - 4);
+    ctx.stroke();
+    ctx.fillStyle = "#ffb454"; ctx.fillRect(c.x, c.y, CW, 2);
+  }
+
+  for (const d of level.doors) {
+    const open = doorOpen(d, plateMap);
+    if (open) {
+      ctx.strokeStyle = "rgba(89,242,194,0.35)";
+      ctx.strokeRect(d.x + 0.5, d.y + 0.5, d.w - 1, d.h - 1);
+    } else {
+      ctx.fillStyle = "rgba(255,93,143,0.16)"; ctx.fillRect(d.x, d.y, d.w, d.h);
+      ctx.fillStyle = "#ff5d8f";
+      const p = (gt * 1.2) % 14;
+      for (let y = d.y - 14 + p; y < d.y + d.h; y += 14) {
+        const yy = Math.max(d.y, y), hh = Math.min(4, d.y + d.h - yy);
+        if (hh > 0) ctx.fillRect(d.x + 2, yy, d.w - 4, hh);
+      }
+      ctx.strokeStyle = "#ff5d8f"; ctx.strokeRect(d.x + 0.5, d.y + 0.5, d.w - 1, d.h - 1);
+      /* lock tags */
+      ctx.fillStyle = "#ff9ab8"; ctx.font = "9px monospace"; ctx.textAlign = "center";
+      ctx.fillText(d.req.map(r => r.toUpperCase()).join("+"), d.x + d.w/2, d.y - 6);
+    }
+  }
+
+  for (const l of level.lasers) {
+    const on = laserOn(l, frame);
+    ctx.fillStyle = "#2c2657";
+    ctx.fillRect(l.x, l.y - 8, l.w, 8); ctx.fillRect(l.x, l.y + l.h, l.w, 8);
+    if (on) {
+      const cx = l.x + l.w/2;
+      const glow = ctx.createLinearGradient(l.x - 8, 0, l.x + l.w + 8, 0);
+      glow.addColorStop(0, "rgba(255,59,107,0)"); glow.addColorStop(0.5, "rgba(255,59,107,0.5)"); glow.addColorStop(1, "rgba(255,59,107,0)");
+      ctx.fillStyle = glow; ctx.fillRect(l.x - 8, l.y, l.w + 16, l.h);
+      ctx.fillStyle = "#ff3b6b"; ctx.fillRect(cx - 2, l.y, 4, l.h);
+      ctx.fillStyle = "rgba(255,255,255,0.85)"; ctx.fillRect(cx - 0.5, l.y, 1, l.h);
+    } else {
+      /* countdown shimmer so timing is readable */
+      const tLeft = l.period - ((frame + l.offset) % l.period);
+      ctx.strokeStyle = tLeft < 20 ? "rgba(255,59,107,0.5)" : "rgba(255,59,107,0.15)";
+      ctx.setLineDash([3, 7]);
+      ctx.beginPath(); ctx.moveTo(l.x + l.w/2, l.y); ctx.lineTo(l.x + l.w/2, l.y + l.h); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+  }
+
+  /* exit portal */
+  const ex = level.exit;
+  const cx = ex[0] + 17, cy = ex[1] + 22;
+  for (let i = 0; i < 3; i++) {
+    ctx.strokeStyle = i === 1 ? "#2bb3ff" : "#59f2c2";
+    ctx.globalAlpha = 0.85 - i * 0.22;
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.ellipse(cx, cy, 14 + i * 5, 22 + i * 5, gt * 0.02 * (i % 2 ? -1 : 1), 0.4, Math.PI * 2 - 0.4 + Math.sin(gt*0.05)*0.3);
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1; ctx.lineWidth = 1;
+  const pg = ctx.createRadialGradient(cx, cy, 2, cx, cy, 24);
+  pg.addColorStop(0, "rgba(89,242,194,0.7)"); pg.addColorStop(1, "rgba(89,242,194,0)");
+  ctx.fillStyle = pg; ctx.beginPath(); ctx.arc(cx, cy, 24, 0, Math.PI*2); ctx.fill();
+}
+
+function drawEntity(e, isEcho, idx) {
+  /* trail */
+  e.trail.forEach((t, i) => {
+    ctx.globalAlpha = (i / e.trail.length) * (isEcho ? 0.10 : 0.16);
+    ctx.fillStyle = isEcho ? "#7be8ff" : "#ffb454";
+    roundRect(t.x, t.y, EW, EH, 6); ctx.fill();
+  });
+  ctx.globalAlpha = 1;
+
+  const bodyC = isEcho ? "rgba(123,232,255,0.55)" : "#ffb454";
+  const edgeC = isEcho ? "rgba(123,232,255,0.9)" : "#ffd9a0";
+
+  ctx.shadowColor = isEcho ? "rgba(123,232,255,0.7)" : "rgba(255,180,84,0.7)";
+  ctx.shadowBlur = 14;
+  ctx.fillStyle = bodyC;
+  roundRect(e.x, e.y, EW, EH, 6); ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.strokeStyle = edgeC; roundRect(e.x + 0.5, e.y + 0.5, EW - 1, EH - 1, 6); ctx.stroke();
+
+  /* visor */
+  ctx.fillStyle = isEcho ? "rgba(255,255,255,0.75)" : "#3a2405";
+  const vx = e.face === 1 ? e.x + 12 : e.x + 4;
+  ctx.fillRect(vx, e.y + 8, 10, 5);
+
+  if (isEcho) {
+    ctx.fillStyle = "rgba(123,232,255,0.9)";
+    ctx.font = "10px monospace"; ctx.textAlign = "center";
+    ctx.fillText("E" + (idx + 1), e.x + EW/2, e.y - 6);
+    if (frame >= e.rec.length) { /* frozen marker */
+      ctx.strokeStyle = "rgba(123,232,255,0.5)";
+      ctx.setLineDash([2,4]);
+      roundRect(e.x - 3.5, e.y - 3.5, EW + 7, EH + 7, 8); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+  }
+}
+
+function drawHUD() {
+  /* top bar */
+  ctx.fillStyle = "rgba(13,11,30,0.75)";
+  ctx.fillRect(0, 0, W, 64);
+  ctx.strokeStyle = "rgba(122,108,240,0.3)";
+  ctx.beginPath(); ctx.moveTo(0, 64.5); ctx.lineTo(W, 64.5); ctx.stroke();
+
+  ctx.textAlign = "left"; ctx.fillStyle = "#e9e6fa"; ctx.font = "600 15px Bahnschrift, 'Segoe UI', sans-serif";
+  ctx.fillText(level.name, 16, 24);
+  ctx.fillStyle = "#8f89b8"; ctx.font = "11px monospace";
+  ctx.fillText(level.hint, 16, 42);
+
+  ctx.textAlign = "right"; ctx.font = "12px monospace";
+  ctx.fillStyle = "#7be8ff";
+  ctx.fillText("ECHOES " + echoes.length + "/" + level.maxEchoes, W - 16, 22);
+  ctx.fillStyle = "#8f89b8";
+  ctx.fillText("FOLDS " + levelFolds + " · PAR " + level.par + "   T+" + (levelFrames/60).toFixed(1) + "s", W - 16, 40);
+
+  /* timeline ribbon — the signature: every committed timeline, stacked */
+  const rx = 16, rw = W - 32, ry = 50;
+  const pxf = rw / REC_CAP;
+  const rows = [...echoes.map(e => e.rec.length), recording.length];
+  rows.forEach((len, i) => {
+    const isCur = i === rows.length - 1;
+    const y = ry + i * 4 - (rows.length - 1) * 4;
+    ctx.fillStyle = isCur ? "rgba(255,180,84,0.9)" : "rgba(123,232,255,0.55)";
+    ctx.fillRect(rx, y, Math.max(2, len * pxf), 3);
+    /* playhead */
+    const ph = Math.min(frame, len) * pxf;
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(rx + ph, y - 1, 2, 5);
+  });
+
+  /* transient message */
+  if (msgT > 0) {
+    ctx.globalAlpha = Math.min(1, msgT / 30);
+    ctx.textAlign = "center";
+    ctx.font = "600 16px Bahnschrift, 'Segoe UI', sans-serif";
+    ctx.fillStyle = "#e9e6fa";
+    ctx.shadowColor = "rgba(122,108,240,0.9)"; ctx.shadowBlur = 12;
+    ctx.fillText(msg, W/2, 96);
+    ctx.shadowBlur = 0; ctx.globalAlpha = 1;
+  }
+}
+
+function drawParticles() {
+  for (const p of particles) {
+    ctx.globalAlpha = Math.min(1, p.life / 25);
+    ctx.fillStyle = p.color;
+    ctx.fillRect(p.x, p.y, 2.5, 2.5);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawScene() {
+  drawBackground();
+  const plateMap = computePlates([...echoes, player]);
+  drawLevelStatics(plateMap);
+  echoes.forEach((e, i) => drawEntity(e, true, i));
+  drawEntity(player, false, 0);
+  drawParticles();
+  drawHUD();
+}
+
+/* ---------- overlays ---------- */
+function drawTitle() {
+  drawBackground();
+  ctx.textAlign = "center";
+  ctx.font = "700 52px Bahnschrift, 'Segoe UI', sans-serif";
+  const g = ctx.createLinearGradient(W/2 - 200, 0, W/2 + 200, 0);
+  g.addColorStop(0, "#7be8ff"); g.addColorStop(0.5, "#7a6cf0"); g.addColorStop(1, "#ffb454");
+  ctx.fillStyle = g;
+  ctx.fillText("C H R O N O F O L D", W/2, 150);
+
+  ctx.fillStyle = "#e9e6fa"; ctx.font = "14px monospace";
+  const lines = [
+    "Every run, your inputs are RECORDED.",
+    "Press R to FOLD TIME — the world rewinds, and an ECHO",
+    "of your past self replays your exact run beside you.",
+    "",
+    "Echoes hold plates.  Echoes are SOLID — stand on them.",
+    "Lasers pass through echoes.  STATIC fields erase them.",
+    "Toggles flip on every crossing.  CRATES persist across folds.",
+    "",
+    "Beat par fold-counts for GOLD. Reach the portal. " + LEVELS.length + " levels."
+  ];
+  lines.forEach((l, i) => ctx.fillText(l, W/2, 210 + i * 24));
+
+  ctx.fillStyle = "#ffb454";
+  ctx.font = "600 16px Bahnschrift, 'Segoe UI', sans-serif";
+  const pulse = 0.6 + 0.4 * Math.sin(gt * 0.08);
+  ctx.globalAlpha = pulse;
+  ctx.fillText(Object.keys(save.best).length ? "PRESS ENTER TO CONTINUE" : "PRESS ENTER TO BEGIN", W/2, 452);
+  ctx.globalAlpha = 1;
+}
+
+function drawSelect() {
+  drawBackground();
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#e9e6fa";
+  ctx.font = "700 32px Bahnschrift, 'Segoe UI', sans-serif";
+  ctx.fillText("SELECT TIMELINE", W/2, 80);
+  const unlocked = unlockedCount(), cols = 5, cw = 160, ch = 120, gx = 20, gy = 20;
+  const x0 = (W - (cols * cw + (cols - 1) * gx)) / 2, y0 = 120;
+  LEVELS.forEach((lv, i) => {
+    const x = x0 + (i % cols) * (cw + gx), y = y0 + Math.floor(i / cols) * (ch + gy);
+    const locked = i >= unlocked, sel = i === selIdx, b = save.best[i];
+    roundRect(x, y, cw, ch, 10);
+    ctx.fillStyle = sel ? "rgba(122,108,240,0.35)" : "rgba(20,17,40,0.85)"; ctx.fill();
+    ctx.strokeStyle = sel ? "#7be8ff" : "#3a3466"; ctx.lineWidth = sel ? 2.5 : 1.5; ctx.stroke();
+    ctx.globalAlpha = locked ? 0.35 : 1;
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#e9e6fa"; ctx.font = "700 30px Bahnschrift, 'Segoe UI', sans-serif";
+    ctx.fillText(String(i + 1).padStart(2, "0"), x + cw/2, y + 48);
+    ctx.font = "10px monospace"; ctx.fillStyle = "#8f89b8";
+    ctx.fillText(lv.name.split("· ")[1], x + cw/2, y + 68);
+    if (locked) ctx.fillText("LOCKED", x + cw/2, y + 100);
+    else if (b) {
+      ctx.fillStyle = MEDAL_C[b.medal];
+      ctx.beginPath(); ctx.arc(x + 22, y + 96, 6, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "#8f89b8"; ctx.textAlign = "left";
+      ctx.fillText("BEST " + b.folds + "/" + b.par + "  " + (b.time/60).toFixed(1) + "s", x + 34, y + 100);
+      ctx.textAlign = "center";
+    } else ctx.fillText("NEW", x + cw/2, y + 100);
+    ctx.globalAlpha = 1;
+  });
+  ctx.fillStyle = "#8f89b8"; ctx.font = "12px monospace"; ctx.textAlign = "center";
+  ctx.fillText("ARROWS move   ENTER play   ESC back", W/2, 480);
+}
+
+function drawPause() {
+  ctx.fillStyle = "rgba(13,11,30,0.72)"; ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#e9e6fa"; ctx.font = "700 34px Bahnschrift, 'Segoe UI', sans-serif";
+  ctx.fillText("PAUSED", W/2, 170);
+  PAUSE_ITEMS.forEach((t, i) => {
+    const sel = i === pauseIdx;
+    ctx.font = (sel ? "700 " : "") + "20px Bahnschrift, 'Segoe UI', sans-serif";
+    ctx.fillStyle = sel ? "#ffb454" : "#8f89b8";
+    ctx.fillText((sel ? "› " : "") + t + (sel ? " ‹" : ""), W/2, 235 + i * 40);
+  });
+  ctx.fillStyle = "#8f89b8"; ctx.font = "12px monospace";
+  ctx.fillText("UP/DOWN choose   LEFT/RIGHT volume   ENTER select   ESC resume", W/2, 495);
+}
+
+function drawWin() {
+  drawBackground();
+  ctx.textAlign = "center";
+  ctx.font = "700 38px Bahnschrift, 'Segoe UI', sans-serif";
+  ctx.fillStyle = "#59f2c2";
+  ctx.fillText("TIMELINE RESOLVED", W/2, 80);
+  ctx.fillStyle = "#8f89b8"; ctx.font = "12px monospace";
+  ctx.fillText("All " + LEVELS.length + " paradoxes closed.", W/2, 104);
+
+  /* medal table — from saved bests, so it is complete even when earlier levels were cleared in past sessions */
+  const rows = LEVELS.map((lv, i) => save.best[i] && Object.assign({ name: lv.name }, save.best[i])).filter(Boolean);
+  const golds = rows.filter(r => r.medal === "GOLD").length;
+  const rowH = Math.min(26, 270 / Math.max(1, rows.length));
+  ctx.font = "12px monospace";
+  rows.forEach((r, i) => {
+    const y = 140 + i * rowH;
+    const mc = MEDAL_C[r.medal];
+    ctx.shadowColor = mc; ctx.shadowBlur = 8;
+    ctx.fillStyle = mc;
+    ctx.beginPath(); ctx.arc(W/2 - 235, y - 4, 6, 0, Math.PI * 2); ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.textAlign = "left"; ctx.fillStyle = "#e9e6fa";
+    ctx.fillText(r.name, W/2 - 215, y);
+    ctx.textAlign = "right"; ctx.fillStyle = "#8f89b8";
+    ctx.fillText("FOLDS " + r.folds + "/" + r.par + "   " + (r.time/60).toFixed(1) + "s", W/2 + 240, y);
+  });
+
+  ctx.textAlign = "center"; ctx.fillStyle = "#e9e6fa"; ctx.font = "13px monospace";
+  ctx.fillText("Golds: " + golds + "/" + LEVELS.length + "    Folds this session: " + totalLoops + "    Desyncs: " + deaths, W/2, 442);
+  ctx.fillStyle = "#8f89b8"; ctx.font = "12px monospace";
+  ctx.globalAlpha = 0.6 + 0.4 * Math.sin(gt * 0.08);
+  ctx.fillText("Press ENTER to run it all back.", W/2, 478);
+  ctx.globalAlpha = 1;
+  drawParticles();
+}
+
+/* ---------- main loop ---------- */
+let last = performance.now(), acc = 0;
+const STEP = 1000 / 60;
+
+function tick(now) {
+  requestAnimationFrame(tick);
+  acc += Math.min(50, now - last); last = now;
+
+  while (acc >= STEP) {
+    acc -= STEP; gt++;
+    update();
+  }
+  render();
+}
+
+function update() {
+  const N = nav; nav = {};
+  stepParticles();
+  if (shake > 0) { shake--; shakeX = (Math.random() - 0.5) * shake; shakeY = (Math.random() - 0.5) * shake; }
+  else shakeX = shakeY = 0;
+  if (msgT > 0) msgT--;
+  /* ambient particles are simulation, not rendering, so they don't scale with refresh rate */
+  if (state === "WIN") {
+    if (gt % 5 === 0) particles.push({x:Math.random()*W, y:H+4, vx:(Math.random()-0.5)*0.6, vy:-1-Math.random()*1.5, life:120, color:["#59f2c2","#7be8ff","#ffb454"][gt%3]});
+  } else if (level && state !== "TITLE" && state !== "SELECT" && gt % 9 === 0) {
+    const cx = level.exit[0] + 17, cy = level.exit[1] + 22;
+    particles.push({x:cx+(Math.random()-0.5)*20, y:cy+20, vx:0, vy:-0.7-Math.random(), life:40, color:"#59f2c2"});
+  }
+
+  if (state === "TITLE") {
+    if (enterPressed) {
+      enterPressed = false; totalLoops = 0; deaths = 0; results = []; startPad();
+      selIdx = unlockedCount() - 1; state = "SELECT";
+    }
+    rPressed = zPressed = false;
+    return;
+  }
+  if (state === "SELECT") {
+    const unlocked = unlockedCount(), cols = 5;
+    if ((N.arrowright || N.d) && selIdx + 1 < unlocked) selIdx++;
+    if ((N.arrowleft || N.a) && selIdx > 0) selIdx--;
+    if ((N.arrowdown || N.s) && selIdx + cols < unlocked) selIdx += cols;
+    if ((N.arrowup || N.w) && selIdx - cols >= 0) selIdx -= cols;
+    if (N.escape) state = "TITLE";
+    else if (enterPressed) { loadLevel(selIdx); state = "PLAY"; }
+    enterPressed = rPressed = zPressed = false;
+    return;
+  }
+  if (state === "PAUSE") {
+    PAUSE_ITEMS[3] = "SOUND: " + (muted ? "OFF" : "ON");
+    PAUSE_ITEMS[4] = "MUSIC  " + volBar(save.settings.music);
+    PAUSE_ITEMS[5] = "SFX    " + volBar(save.settings.sfx);
+    const n = PAUSE_ITEMS.length;
+    if (N.arrowdown || N.s) pauseIdx = (pauseIdx + 1) % n;
+    if (N.arrowup || N.w) pauseIdx = (pauseIdx + n - 1) % n;
+    const dv = (N.arrowright || N.d ? 1 : 0) - (N.arrowleft || N.a ? 1 : 0);
+    if (dv && pauseIdx >= 4) adjustVolume(pauseIdx === 4 ? "music" : "sfx", dv);
+    if (N.escape) state = "PLAY";
+    else if (enterPressed) {
+      if (pauseIdx === 0) state = "PLAY";
+      else if (pauseIdx === 1) { restartLevel(); showMsg("LEVEL RESTARTED"); state = "PLAY"; }
+      else if (pauseIdx === 2) { selIdx = levelIdx; state = "SELECT"; }
+      else if (pauseIdx === 3) toggleMute();
+    }
+    enterPressed = rPressed = zPressed = false;
+    return;
+  }
+  if (state === "WIN") {
+    if (enterPressed) { enterPressed = false; state = "TITLE"; }
+    rPressed = zPressed = false;
+    return;
+  }
+  if (state === "CLEAR") {
+    rPressed = zPressed = false;
+    clearT--;
+    if (enterPressed) { enterPressed = false; clearT = 0; }
+    if (clearT <= 0) {
+      if (levelIdx + 1 < LEVELS.length) { loadLevel(levelIdx + 1); state = "PLAY"; }
+      else if (Object.keys(save.best).length >= LEVELS.length) { state = "WIN"; SFX.win(); }
+      else { selIdx = 0; state = "SELECT"; }
+    }
+    return;
+  }
+  if (state === "REWIND") {
+    rPressed = zPressed = enterPressed = false;
+    rewindPtr -= 7;
+    if (gt % 2 === 0 && rewindPtr > 0 && hist[rewindPtr])
+      particles.push({x:hist[rewindPtr].p[0]+EW/2, y:hist[rewindPtr].p[1]+EH/2, vx:(Math.random()-0.5)*2, vy:(Math.random()-0.5)*2, life:20, color:"#7be8ff"});
+    if (rewindPtr <= 0) finishFold();
+    return;
+  }
+
+  /* PLAY — Enter/clicks mean nothing here; drop them so they can't fire later in a menu */
+  enterPressed = false;
+  if (N.escape) { pauseIdx = 0; state = "PAUSE"; rPressed = zPressed = false; return; }
+  if (zPressed) {
+    zPressed = false;
+    restartLevel();
+    showMsg("TIMELINE WIPED");
+    return;
+  }
+  if (rPressed) { rPressed = false; foldTime(); if (state === "REWIND") return; }
+
+  const result = simulateFrame();
+  if (result === "desync") {
+    deaths++; levelDeaths++; shake = 12;
+    SFX.desync();
+    burst(player.x + EW/2, player.y + EH/2, "#ff3b6b", 34);
+    fullResetLoop();
+    showMsg("DESYNC — LOOP RESTARTED");
+  } else if (result === "clear") {
+    results[levelIdx] = {
+      name: level.name, folds: levelFolds, par: level.par,
+      time: levelFrames, deaths: levelDeaths, medal: medalFor(levelFolds, level.par)
+    };
+    recordBest(levelIdx, results[levelIdx]);
+    SFX.clear();
+    burst(level.exit[0] + 17, level.exit[1] + 22, "#59f2c2", 44);
+    state = "CLEAR"; clearT = 190;
+    showMsg("");
+  }
+}
+
+let dpr = 1;
+function fitCanvas() {
+  const d = Math.min(2, window.devicePixelRatio || 1);
+  if (d !== dpr || cv.width !== Math.round(W * d)) {
+    dpr = d; cv.width = Math.round(W * d); cv.height = Math.round(H * d);
+    cv.style.width = W + "px";   /* CSS caps this at the container width */
+  }
+}
+function render() {
+  fitCanvas();
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.save();
+  ctx.translate(shakeX, shakeY);
+
+  if (state === "TITLE") { drawTitle(); ctx.restore(); return; }
+  if (state === "SELECT") { drawSelect(); ctx.restore(); return; }
+  if (state === "WIN") { drawWin(); ctx.restore(); return; }
+
+  if (state === "REWIND") {
+    /* draw the world at a historical moment, running backwards */
+    const snap = hist[Math.max(0, rewindPtr)];
+    drawBackground();
+    const plateMap = computePlates(snap
+      ? [...snap.e.map(p => ({x:p[0], y:p[1]})), {x:snap.p[0], y:snap.p[1]}]
+      : [...echoes, player]);
+    drawLevelStatics(plateMap);
+    if (snap) {
+      echoes.forEach((e, i) => {
+        const pos = snap.e[i];
+        if (pos) drawEntity({...e, x:pos[0], y:pos[1], trail:[]}, true, i);
+      });
+      drawEntity({...player, x:snap.p[0], y:snap.p[1], trail:[]}, false, 0);
+    }
+    drawParticles();
+    /* rewind chrome */
+    ctx.fillStyle = "rgba(123,232,255,0.06)"; ctx.fillRect(0, 0, W, H);
+    ctx.strokeStyle = "rgba(123,232,255,0.25)";
+    for (let i = 0; i < 4; i++) {
+      const y = ((gt * -9) + i * 140) % (H + 140);
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+    }
+    ctx.textAlign = "center"; ctx.fillStyle = "#7be8ff";
+    ctx.font = "700 26px Bahnschrift, 'Segoe UI', sans-serif";
+    ctx.fillText("◀◀ FOLDING TIME", W/2, H/2);
+    drawHUD();
+    ctx.restore();
+    return;
+  }
+
+  drawScene();
+  if (state === "PAUSE") drawPause();
+
+  if (state === "CLEAR") {
+    ctx.fillStyle = "rgba(13,11,30,0.62)"; ctx.fillRect(0, 0, W, H);
+    const res = results[levelIdx];
+    if (res) {
+      const mc = MEDAL_C[res.medal];
+      ctx.textAlign = "center";
+      ctx.font = "700 30px Bahnschrift, 'Segoe UI', sans-serif";
+      ctx.fillStyle = "#59f2c2";
+      ctx.fillText("STABILIZED", W/2, 180);
+      /* medal disc */
+      ctx.shadowColor = mc; ctx.shadowBlur = 26;
+      ctx.fillStyle = mc;
+      ctx.beginPath(); ctx.arc(W/2, 252, 34, 0, Math.PI * 2); ctx.fill();
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = "#141128";
+      ctx.beginPath(); ctx.arc(W/2, 252, 26, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = mc; ctx.font = "700 15px Bahnschrift, 'Segoe UI', sans-serif";
+      ctx.fillText(res.medal, W/2, 257);
+      ctx.fillStyle = "#e9e6fa"; ctx.font = "13px monospace";
+      ctx.fillText("FOLDS " + res.folds + "  ·  PAR " + res.par + "  ·  " + (res.time/60).toFixed(1) + "s" + (res.deaths ? "  ·  DESYNCS " + res.deaths : ""), W/2, 318);
+      ctx.fillStyle = "#8f89b8"; ctx.font = "11px monospace";
+      ctx.fillText(res.folds <= res.par ? "Perfect fold count." : "Par is " + res.par + " — fewer echoes next time?", W/2, 342);
+      ctx.globalAlpha = 0.6 + 0.4 * Math.sin(gt * 0.1);
+      ctx.fillText("ENTER to continue", W/2, 386);
+      ctx.globalAlpha = 1;
+    }
+  }
+  ctx.restore();
+}
+
+requestAnimationFrame(tick);
